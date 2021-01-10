@@ -55,6 +55,11 @@ static cl::opt<bool> WasmDisableExplicitLocals(
              " instruction output for test purposes only."),
     cl::init(false));
 
+static cl::opt<std::string>
+EmitFunctionGraphData("emit-symbol-graph-json",
+           cl::desc("Generates function debugging, call flow and data dependency information to the specified JSON file"),
+           cl::init(""));
+
 extern "C" LLVM_EXTERNAL_VISIBILITY void LLVMInitializeWebAssemblyTarget() {
   // Register the target.
   RegisterTargetMachine<WebAssemblyTargetMachine> X(
@@ -498,6 +503,9 @@ void WebAssemblyPassConfig::addPreEmitPass() {
   // Fix debug_values whose defs have been stackified.
   if (!WasmDisableExplicitLocals)
     addPass(createWebAssemblyDebugFixup());
+
+  if (!EmitFunctionGraphData.empty())
+    addPass(createEmitFunctionGraphDataPass(EmitFunctionGraphData));
 }
 
 yaml::MachineFunctionInfo *
