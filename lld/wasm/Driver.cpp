@@ -1025,30 +1025,61 @@ static void createOptionalSymbols() {
 
 static void processStubLibrariesPreLTO() {
   log("-- processStubLibrariesPreLTO");
+  // The LTO code generator may introduce references to compiler-rt libcall
+  // functions that are not present in the input bitcode (e.g. lowering an
+  // llvm.memcpy intrinsic to a call to memcpy).  For a stub symbol that is
+  // one of those libcalls we must preserve its native dependencies even
+  // though the symbol is not (yet) present in the symbol table.
+  DenseSet<StringRef> ltoLibcallSymbols;
+  if (!ctx.bitcodeFiles.empty()) {
+    llvm::Triple TT(ctx.bitcodeFiles.front()->obj->getTargetTriple());
+    for (auto *s : lto::LTO::getRuntimeLibcallSymbols(TT))
+      ltoLibcallSymbols.insert(s);
+  }
   for (auto &stub_file : ctx.stubFiles) {
     LLVM_DEBUG(llvm::dbgs()
                << "processing stub file: " << stub_file->getName() << "\n");
     for (auto [name, deps] : stub_file->symbolDependencies) {
       auto *sym = symtab->find(name);
-      // If the symbol is not present at all (yet), or if it is present but
-      // undefined, then mark the dependent symbols as used by a regular
-      // object so they will be preserved and exported by the LTO process.
-      if (!sym || sym->isUndefined()) {
-        for (const auto dep : deps) {
-          auto *needed = symtab->find(dep);
-          if (needed) {
-            needed->isUsedInRegularObj = true;
-            // Like with handleLibcall we have to extract any LTO archive
-            // members that might need to be exported due to stub library
-            // symbols being referenced.  Without this the LTO object could be
-            // extracted during processStubLibraries, which is too late since
-            // LTO has already being performed at that point.
-            if (needed->isLazy() && isa<BitcodeFile>(needed->getFile())) {
-              if (!ctx.arg.whyExtract.empty())
-                ctx.whyExtractRecords.emplace_back(toString(stub_file),
-                                                   needed->getFile(), *needed);
-              cast<LazySymbol>(needed)->extract();
-            }
+      // Preserve a stub symbol's native dependencies through the LTO process
+      // only if the symbol is (or will be) imported by the final wasm module,
+      // i.e. if it is referenced by code that is part of the link.  Pre-LTO
+      // that reference is visible in exactly two cases:
+      //   - the symbol is present in the table as an undefined reference,
+      //     meaning some active input (a regular object or an already
+      //     extracted bitcode archive member) references it;
+      //   - the symbol is absent but is a compiler-rt libcall that the LTO
+      //     code generator may reference (see above).
+      //
+      // In every other case the symbol is not referenced by any input in the
+      // link: lazy archive members do not contribute their undefined
+      // references to the table (see BitcodeFile::parseLazy), and LTO does
+      // not create references to arbitrary external symbols.  The symbol will
+      // therefore not be imported and its native dependencies may be DCE'd by
+      // the LTO process.  Preserving them unconditionally, as was done
+      // before, forced every stub dependency to be kept and its archive
+      // member extracted even when nothing referenced the JS symbol, dragging
+      // a large amount of dead code (e.g. the whole itimer/signal machinery)
+      // into -flto builds.  See emscripten-core/emscripten#26038.
+      bool preserveDeps =
+          (sym && sym->isUndefined()) ||
+          (!sym && ltoLibcallSymbols.contains(name));
+      if (!preserveDeps)
+        continue;
+      for (const auto dep : deps) {
+        auto *needed = symtab->find(dep);
+        if (needed) {
+          needed->isUsedInRegularObj = true;
+          // Like with handleLibcall we have to extract any LTO archive
+          // members that might need to be exported due to stub library
+          // symbols being referenced.  Without this the LTO object could be
+          // extracted during processStubLibraries, which is too late since
+          // LTO has already being performed at that point.
+          if (needed->isLazy() && isa<BitcodeFile>(needed->getFile())) {
+            if (!ctx.arg.whyExtract.empty())
+              ctx.whyExtractRecords.emplace_back(toString(stub_file),
+                                                 needed->getFile(), *needed);
+            cast<LazySymbol>(needed)->extract();
           }
         }
       }
